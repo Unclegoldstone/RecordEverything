@@ -201,6 +201,59 @@ fn database_migrations() -> Vec<Migration> {
                 ON global_todos(completed, created_at, id);
         "#,
         kind: MigrationKind::Up,
+    },
+    Migration {
+        version: 6,
+        description: "add_learning_records",
+        sql: r#"
+            CREATE TABLE learning_components (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                stable_id TEXT NOT NULL,
+                template_version_id INTEGER NOT NULL,
+                name TEXT NOT NULL DEFAULT '今日所学',
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+                FOREIGN KEY (template_version_id) REFERENCES template_versions(id) ON DELETE CASCADE,
+                UNIQUE (template_version_id, stable_id)
+            );
+
+            CREATE TABLE learning_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                record_id INTEGER NOT NULL,
+                component_id INTEGER NOT NULL,
+                logo TEXT NOT NULL DEFAULT '✏️',
+                tag TEXT NOT NULL DEFAULT '',
+                duration_minutes INTEGER CHECK (duration_minutes IS NULL OR (duration_minutes > 0 AND duration_minutes < 1440)),
+                knowledge TEXT NOT NULL DEFAULT '',
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (record_id) REFERENCES daily_records(id) ON DELETE CASCADE,
+                FOREIGN KEY (component_id) REFERENCES learning_components(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX idx_learning_components_version_order
+                ON learning_components(template_version_id, active, sort_order);
+            CREATE INDEX idx_learning_components_stable_id
+                ON learning_components(stable_id);
+            CREATE INDEX idx_learning_entries_record_component
+                ON learning_entries(record_id, component_id, sort_order);
+            CREATE INDEX idx_learning_entries_tag
+                ON learning_entries(tag);
+        "#,
+        kind: MigrationKind::Up,
+    },
+    Migration {
+        version: 7,
+        description: "remove_negative_weight_values",
+        sql: r#"
+            DELETE FROM number_values
+             WHERE value < 0
+               AND component_id IN (
+                 SELECT id FROM number_components WHERE component_kind = 'weight'
+               );
+        "#,
+        kind: MigrationKind::Up,
     }]
 }
 

@@ -1,11 +1,14 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import {
   initializeDatabase,
   loadDay,
   loadNumberSeries,
+  loadLearningHeatmap,
+  loadLearningHistory,
+  loadLearningTags,
   loadRecordedDates,
   loadRecordingStreak,
   loadTodos,
@@ -21,12 +24,18 @@ import {
   type ComponentSeries,
   type StatisticType,
   type TodoItem,
+  type LearningEntry,
+  type LearningDaySummary,
+  type LearningHistoryEntry,
 } from "./services/database";
 
 const templateComponents = ref<NumberComponent[]>([]);
 const templateDraft = ref<NumberComponent[]>([]);
 const values = reactive<Record<string, number | null>>({});
 const touched = reactive<Record<string, boolean>>({});
+const learningEntries = reactive<Record<string, LearningEntry[]>>({});
+const learningTags = ref<string[]>([]);
+const learningLogos = ["📖", "💻", "🌐", "🧮", "🔬", "🎨", "🎵", "✏️"];
 const todos = ref<TodoItem[]>([]);
 const newTodo = ref("");
 const todoError = ref("");
@@ -45,17 +54,29 @@ const templateSaving = ref(false);
 const saved = ref(true);
 const saving = ref(false);
 const validationError = ref("");
-const chartRange = ref("30天");
+const chartRanges = reactive<Record<string, "7天" | "30天" | "90天">>({});
+const chartRangeMenuOpen = ref<string | null>(null);
 const selectedDate = ref(new Date());
 const visibleMonth = ref(new Date(selectedDate.value.getFullYear(), selectedDate.value.getMonth(), 1));
 const templateVersionId = ref<number | null>(null);
 const recordedDates = ref(new Set<string>());
 const recordingStreak = ref(0);
 const chartSeries = reactive<Record<string, ComponentSeries>>({});
+const learningHeatmaps = reactive<Record<string, LearningDaySummary[]>>({});
+const learningChartMonths = reactive<Record<string, string>>({});
+const expandedLearningEntries = ref<LearningHistoryEntry[]>([]);
+const selectedLearningDetailDate = ref<string | null>(null);
 const weightCurveVisible = reactive({ morning: true, evening: true });
 const collapsedCharts = reactive<Record<string, boolean>>({});
 const expandedChartId = ref<string | null>(null);
+const hoveredChartDate = ref<string | null>(null);
+const sampleCalendarMonth = ref(new Date(selectedDate.value.getFullYear(), selectedDate.value.getMonth(), 1));
+const sampleCalendarSeries = ref<ComponentSeries | null>(null);
+const sampleCalendarLoading = ref(false);
 const expandedComponent = computed(() => templateComponents.value.find((item) => item.id === expandedChartId.value) ?? null);
+const sampleCalendarMonthLabel = computed(() =>
+  new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "long" }).format(sampleCalendarMonth.value),
+);
 const loading = ref(true);
 const currentTime = ref(new Date());
 let clockTimer: ReturnType<typeof setInterval> | null = null;
@@ -234,6 +255,105 @@ function detailDatePositions(component: NumberComponent) {
   }));
 }
 
+async function openExpandedChart(componentId: string) {
+  hoveredChartDate.value = null;
+  expandedChartId.value = componentId;
+  const component = templateComponents.value.find((item) => item.id === componentId);
+  if (component?.type === "learning") {
+    const [year, month] = learningMonthKey(component).split("-").map(Number);
+    sampleCalendarMonth.value = new Date(year, month - 1, 1);
+    selectedLearningDetailDate.value = null;
+    await refreshExpandedLearning();
+    return;
+  }
+  sampleCalendarMonth.value = new Date(selectedDate.value.getFullYear(), selectedDate.value.getMonth(), 1);
+  await refreshSampleCalendar();
+}
+
+function closeExpandedChart() {
+  hoveredChartDate.value = null;
+  sampleCalendarSeries.value = null;
+  expandedLearningEntries.value = [];
+  selectedLearningDetailDate.value = null;
+  expandedChartId.value = null;
+}
+
+async function refreshSampleCalendar() {
+  const component = expandedComponent.value;
+  if (!component || component.type === "learning") return;
+  sampleCalendarLoading.value = true;
+  try {
+    const start = formatDateKey(new Date(sampleCalendarMonth.value.getFullYear(), sampleCalendarMonth.value.getMonth(), 1));
+    const end = formatDateKey(new Date(sampleCalendarMonth.value.getFullYear(), sampleCalendarMonth.value.getMonth() + 1, 0));
+    sampleCalendarSeries.value = await loadNumberSeries(component.id, start, end);
+  } finally {
+    sampleCalendarLoading.value = false;
+  }
+}
+
+async function changeSampleCalendarMonth(offset: number) {
+  sampleCalendarMonth.value = new Date(sampleCalendarMonth.value.getFullYear(), sampleCalendarMonth.value.getMonth() + offset, 1);
+  await refreshSampleCalendar();
+}
+
+async function refreshExpandedLearning() {
+  const component = expandedComponent.value;
+  if (!component || component.type !== "learning") return;
+  sampleCalendarLoading.value = true;
+  try {
+    const start = formatDateKey(new Date(sampleCalendarMonth.value.getFullYear(), sampleCalendarMonth.value.getMonth(), 1));
+    const end = formatDateKey(new Date(sampleCalendarMonth.value.getFullYear(), sampleCalendarMonth.value.getMonth() + 1, 0));
+    expandedLearningEntries.value = await loadLearningHistory(component.id, start, end);
+  } finally {
+    sampleCalendarLoading.value = false;
+  }
+}
+
+async function changeExpandedLearningMonth(offset: number) {
+  sampleCalendarMonth.value = new Date(sampleCalendarMonth.value.getFullYear(), sampleCalendarMonth.value.getMonth() + offset, 1);
+  selectedLearningDetailDate.value = null;
+  await refreshExpandedLearning();
+}
+
+function updateChartHover(component: NumberComponent, event: MouseEvent) {
+  const svg = event.currentTarget as SVGSVGElement;
+  const matrix = svg.getScreenCTM();
+  if (!matrix) return;
+  const pointer = svg.createSVGPoint();
+  pointer.x = event.clientX;
+  pointer.y = event.clientY;
+  const chartPoint = pointer.matrixTransform(matrix.inverse());
+  const dates = detailDatePositions(component);
+  if (!dates.length || chartPoint.x < 45 || chartPoint.x > 690 || chartPoint.y < 45 || chartPoint.y > 305) {
+    hoveredChartDate.value = null;
+    return;
+  }
+  hoveredChartDate.value = dates.reduce((nearest, item) =>
+    Math.abs(item.x - chartPoint.x) < Math.abs(nearest.x - chartPoint.x) ? item : nearest,
+  ).date;
+}
+
+function hoveredDateX(component: NumberComponent) {
+  return detailDatePositions(component).find((item) => item.date === hoveredChartDate.value)?.x ?? 55;
+}
+
+function hoveredSamplePoints(component: NumberComponent) {
+  if (!hoveredChartDate.value) return [];
+  const slots = component.type === "weight" ? ["morning", "evening"] as const : ["single"] as const;
+  return slots.flatMap((slot) => {
+    if (slot === "morning" && !weightCurveVisible.morning) return [];
+    if (slot === "evening" && !weightCurveVisible.evening) return [];
+    return detailPoints(component, slot)
+      .filter((point) => point.date === hoveredChartDate.value)
+      .map((point) => ({
+        ...point,
+        slot,
+        label: slot === "morning" ? "早上" : slot === "evening" ? "晚上" : "记录",
+        color: slot === "morning" ? "#729b8b" : slot === "evening" ? "#d09a72" : component.color,
+      }));
+  });
+}
+
 function detailRows(component: NumberComponent) {
   const series = chartSeries[component.id];
   if (!series) return [];
@@ -244,6 +364,95 @@ function detailRows(component: NumberComponent) {
       ]
     : series.single.map((point) => ({ ...point, slot: "记录" }));
   return rows.sort((a, b) => a.date.localeCompare(b.date) || a.slot.localeCompare(b.slot));
+}
+
+function curveCalendars(component: NumberComponent) {
+  const series = sampleCalendarSeries.value;
+  if (!series) return [];
+  const curves = component.type === "weight"
+    ? [
+        { slot: "morning" as const, label: "早上体重", color: "#729b8b" },
+        { slot: "evening" as const, label: "晚上体重", color: "#d09a72" },
+      ]
+    : [{ slot: "single" as const, label: component.label, color: component.color }];
+  const year = sampleCalendarMonth.value.getFullYear();
+  const month = sampleCalendarMonth.value.getMonth();
+
+  return curves.map((curve) => {
+    const valueByDate = new Map(series[curve.slot].map((point) => [point.date, displayPointValue(component, point.value)]));
+    const daysInMonth = new Date(year, month + 1, 0).getDate();
+    const mondayOffset = (new Date(year, month, 1).getDay() + 6) % 7;
+    const cells: Array<{ key: string; day: number | null; date: string; inRange: boolean; value: number | null }> = [];
+    for (let index = 0; index < mondayOffset; index += 1) {
+      cells.push({ key: `blank-${index}`, day: null, date: "", inRange: false, value: null });
+    }
+    for (let day = 1; day <= daysInMonth; day += 1) {
+      const date = formatDateKey(new Date(year, month, day));
+      cells.push({ key: date, day, date, inRange: true, value: valueByDate.get(date) ?? null });
+    }
+    return { ...curve, cells, sampleCount: valueByDate.size };
+  });
+}
+
+function learningMonthKey(component: NumberComponent) {
+  return learningChartMonths[component.id] ?? `${selectedDate.value.getFullYear()}-${String(selectedDate.value.getMonth() + 1).padStart(2, "0")}`;
+}
+
+function monthKeyBounds(monthKey: string) {
+  const [year, month] = monthKey.split("-").map(Number);
+  return [formatDateKey(new Date(year, month - 1, 1)), formatDateKey(new Date(year, month, 0))] as const;
+}
+
+function heatLevel(minutes: number) {
+  if (minutes <= 0) return 0;
+  if (minutes < 30) return 1;
+  if (minutes < 60) return 2;
+  if (minutes < 120) return 3;
+  if (minutes < 240) return 4;
+  return 5;
+}
+
+function learningCalendarCells(component: NumberComponent, expanded = false) {
+  const monthKey = expanded
+    ? `${sampleCalendarMonth.value.getFullYear()}-${String(sampleCalendarMonth.value.getMonth() + 1).padStart(2, "0")}`
+    : learningMonthKey(component);
+  const [year, monthNumber] = monthKey.split("-").map(Number);
+  const month = monthNumber - 1;
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const offset = (new Date(year, month, 1).getDay() + 6) % 7;
+  const summaries = new Map((learningHeatmaps[component.id] ?? []).map((day) => [day.date, day]));
+  const entriesByDate = new Map<string, LearningHistoryEntry[]>();
+  if (expanded) expandedLearningEntries.value.forEach((entry) => {
+    const entries = entriesByDate.get(entry.date) ?? [];
+    entries.push(entry);
+    entriesByDate.set(entry.date, entries);
+  });
+  const cells: Array<{ key: string; day: number | null; date: string; summary?: LearningDaySummary; entries: LearningHistoryEntry[] }> = [];
+  for (let index = 0; index < offset; index += 1) cells.push({ key: `blank-${index}`, day: null, date: "", entries: [] });
+  for (let day = 1; day <= daysInMonth; day += 1) {
+    const date = formatDateKey(new Date(year, month, day));
+    cells.push({ key: date, day, date, summary: summaries.get(date), entries: entriesByDate.get(date) ?? [] });
+  }
+  return cells;
+}
+
+function learningMonthTotal(component: NumberComponent) {
+  return (learningHeatmaps[component.id] ?? []).reduce((sum, day) => sum + day.totalMinutes, 0);
+}
+
+function learningMonthDisplay(component: NumberComponent) {
+  const [year, month] = learningMonthKey(component).split("-").map(Number);
+  return `${year}年${month}月`;
+}
+
+function handleLearningMonthInput(component: NumberComponent, event: Event) {
+  const value = (event.target as HTMLInputElement).value;
+  if (value) void setLearningChartMonth(component, value);
+}
+
+function selectedLearningDetails() {
+  if (!selectedLearningDetailDate.value) return [];
+  return expandedLearningEntries.value.filter((entry) => entry.date === selectedLearningDetailDate.value);
 }
 
 function toggleWeightCurve(slot: "morning" | "evening") {
@@ -395,15 +604,44 @@ function updateValue(component: NumberComponent, slot?: "morning" | "evening") {
   if ((values[key] as number | string | null) === "") {
     values[key] = null;
   } else if (typeof values[key] === "number") {
+    if (component.type === "weight" && (values[key] as number) < 0) values[key] = 0;
     const factor = 10 ** component.decimalPlaces;
     values[key] = Math.round((values[key] as number) * factor) / factor;
   }
   markChanged();
 }
 
+function addLearningEntry(component: NumberComponent) {
+  const existing = Object.values(learningEntries).flat();
+  const logo = existing.length ? existing[existing.length - 1].logo : "📖";
+  if (!learningEntries[component.id]) learningEntries[component.id] = [];
+  learningEntries[component.id].push({
+    id: null, clientId: `learning-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    logo, tag: "", durationMinutes: null, knowledge: "",
+  });
+  markChanged();
+}
+
+function updateLearningEntry(entry: LearningEntry) {
+  if ((entry.durationMinutes as number | string | null) === "") entry.durationMinutes = null;
+  if (typeof entry.durationMinutes === "number") entry.durationMinutes = Math.round(entry.durationMinutes);
+  if (entry.tag.length > 20) entry.tag = entry.tag.slice(0, 20);
+  markChanged();
+}
+
+function removeLearningEntry(componentId: string, clientId: string) {
+  learningEntries[componentId] = (learningEntries[componentId] ?? []).filter((entry) => entry.clientId !== clientId);
+  markChanged();
+}
+
+function learningEntryValid(entry: LearningEntry) {
+  return Boolean(entry.logo && entry.tag.trim() && entry.durationMinutes !== null && entry.durationMinutes > 0 && entry.durationMinutes < 1440);
+}
+
 async function saveRecord() {
   if (activeSave) return activeSave;
   const outOfRange = templateComponents.value.find((component) => {
+    if (component.type === "learning") return false;
     const value = values[component.id];
     if (value === null) return false;
     return (component.minValue !== null && value < component.minValue) || (component.maxValue !== null && value > component.maxValue);
@@ -418,15 +656,19 @@ async function saveRecord() {
   const components = templateComponents.value.map((component) => ({ ...component }));
   const valueSnapshot = { ...values };
   const touchedSnapshot = { ...touched };
+  const learningSnapshot = Object.fromEntries(
+    Object.entries(learningEntries).map(([key, entries]) => [key, entries.map((entry) => ({ ...entry }))]),
+  );
   const savedRevision = changeRevision;
   saving.value = true;
   activeSave = (async () => {
     try {
-      await saveDay(date, versionId, components, valueSnapshot, touchedSnapshot);
+      await saveDay(date, versionId, components, valueSnapshot, touchedSnapshot, learningSnapshot);
       validationError.value = "";
       saved.value = savedRevision === changeRevision;
       await refreshRecordedDates();
       if (date === formatDateKey(selectedDate.value)) await Promise.all([refreshStats(), refreshStreak()]);
+      learningTags.value = await loadLearningTags();
     } catch (error) {
       validationError.value = `保存失败：${error instanceof Error ? error.message : String(error)}`;
     } finally {
@@ -492,6 +734,20 @@ function addWeightComponent() {
   catalogOpen.value = false;
 }
 
+function addLearningComponent() {
+  if (templateDraft.value.some((component) => component.type === "learning")) {
+    editorError.value = "模板中已有“今日所学”组件";
+    return;
+  }
+  templateDraft.value.push({
+    databaseId: null, id: `learning-${Date.now()}`, type: "learning", label: "今日所学",
+    hint: "记录今天学到的知识", unit: "分钟", decimalPlaces: 0,
+    defaultValue: null, required: false, minValue: 1, maxValue: 1439,
+    chart: true, chartType: "line", statistic: "latest", color: "#6f9984",
+  });
+  catalogOpen.value = false;
+}
+
 function replaceReactiveRecord<T>(target: Record<string, T>, source: Record<string, T>) {
   Object.keys(target).forEach((key) => delete target[key]);
   Object.assign(target, source);
@@ -506,6 +762,7 @@ async function loadSelectedDay() {
     templateComponents.value = day.components;
     replaceReactiveRecord(values, day.values);
     replaceReactiveRecord(touched, day.touched);
+    replaceReactiveRecord(learningEntries, day.learningEntries);
     saved.value = true;
     await Promise.all([refreshStats(), refreshStreak()]);
   } catch (error) {
@@ -530,19 +787,45 @@ async function refreshStreak() {
   recordingStreak.value = await loadRecordingStreak(formatDateKey(selectedDate.value));
 }
 
-function chartStartDate() {
-  const days = Number.parseInt(chartRange.value, 10);
+function componentChartRange(component: NumberComponent) {
+  return chartRanges[component.id] ?? "30天";
+}
+
+function chartStartDate(component: NumberComponent) {
+  const days = Number.parseInt(componentChartRange(component), 10);
   const start = new Date(selectedDate.value);
   start.setDate(start.getDate() - days + 1);
   return formatDateKey(start);
 }
 
-async function refreshStats() {
+function chartStartLabel(component: NumberComponent) {
+  const [year, month, day] = chartStartDate(component).split("-").map(Number);
+  return new Intl.DateTimeFormat("zh-CN", { month: "short", day: "numeric" }).format(new Date(year, month - 1, day));
+}
+
+async function setComponentChartRange(component: NumberComponent, range: "7天" | "30天" | "90天") {
+  chartRanges[component.id] = range;
+  chartRangeMenuOpen.value = null;
+  await refreshComponentStats(component);
+}
+
+async function setLearningChartMonth(component: NumberComponent, month: string) {
+  learningChartMonths[component.id] = month;
+  await refreshComponentStats(component);
+}
+
+async function refreshComponentStats(component: NumberComponent) {
+  if (component.type === "learning") {
+    const [start, end] = monthKeyBounds(learningMonthKey(component));
+    learningHeatmaps[component.id] = await loadLearningHeatmap(component.id, start, end);
+    return;
+  }
   const end = formatDateKey(selectedDate.value);
-  const start = chartStartDate();
-  await Promise.all(chartComponents.value.map(async (component) => {
-    chartSeries[component.id] = await loadNumberSeries(component.id, start, end);
-  }));
+  chartSeries[component.id] = await loadNumberSeries(component.id, chartStartDate(component), end);
+}
+
+async function refreshStats() {
+  await Promise.all(chartComponents.value.map((component) => refreshComponentStats(component)));
 }
 
 async function openTemplateEditor() {
@@ -601,15 +884,14 @@ async function applyTemplateChanges() {
   }
 }
 
-watch(chartRange, () => { void refreshStats(); });
-
 onMounted(async () => {
   clockTimer = setInterval(() => { currentTime.value = new Date(); }, 60_000);
   try {
     const today = formatDateKey(new Date());
     await initializeDatabase(today);
-    const [, , storedTodos] = await Promise.all([loadSelectedDay(), refreshRecordedDates(), loadTodos()]);
+    const [, , storedTodos, storedTags] = await Promise.all([loadSelectedDay(), refreshRecordedDates(), loadTodos(), loadLearningTags()]);
     todos.value = storedTodos;
+    learningTags.value = storedTags;
   } catch (error) {
     validationError.value = `数据库初始化失败：${error instanceof Error ? error.message : String(error)}`;
     loading.value = false;
@@ -715,13 +997,29 @@ onBeforeUnmount(() => {
           <article v-for="component in templateComponents" :key="component.id" class="field-card">
             <div class="field-heading"><div><label>{{ component.label }}</label><small>{{ component.hint }}</small></div><span v-if="component.chart" class="chartable">可统计</span></div>
 
-            <div v-if="component.type === 'weight'" class="weight-controls">
+            <div v-if="component.type === 'learning'" class="learning-records">
+              <article v-for="(entry, entryIndex) in learningEntries[component.id]" :key="entry.clientId" :class="['learning-entry-card', { invalid: !learningEntryValid(entry) }]">
+                <div class="learning-alpha">
+                  <label class="learning-logo"><span>Logo</span><select v-model="entry.logo" @change="updateLearningEntry(entry)"><option v-for="logo in learningLogos" :key="logo" :value="logo">{{ logo }}</option></select></label>
+                  <label class="learning-tag"><span>Tag <em>必填 · 最多 20 字</em></span><input v-model="entry.tag" :list="`learning-tags-${component.id}`" maxlength="20" placeholder="如：Vue 响应式原理" @input="updateLearningEntry(entry)" /></label>
+                  <label class="learning-duration"><span>学习时长</span><div><input v-model.number="entry.durationMinutes" type="number" min="1" max="1439" placeholder="0" @input="updateLearningEntry(entry)" /><b>分钟</b></div></label>
+                  <button class="learning-delete" title="删除这条学习记录" @click="removeLearningEntry(component.id, entry.clientId)">×</button>
+                </div>
+                <label class="learning-beta"><span>具体知识点 <em>可选</em></span><textarea v-model="entry.knowledge" rows="4" placeholder="记下今天学到的概念、结论或疑问…" @input="updateLearningEntry(entry)"></textarea></label>
+                <small v-if="!learningEntryValid(entry)" class="learning-validation">请填写 Tag，并将学习时长设为 1–1439 分钟；完整后才会计入热力图。</small>
+                <span class="learning-index">#{{ entryIndex + 1 }}</span>
+              </article>
+              <datalist :id="`learning-tags-${component.id}`"><option v-for="tag in learningTags" :key="tag" :value="tag" /></datalist>
+              <button class="add-learning-entry" @click="addLearningEntry(component)">＋ 添加一条学习记录</button>
+            </div>
+            <div v-else-if="component.type === 'weight'" class="weight-controls">
               <label v-for="slot in (['morning', 'evening'] as const)" :key="slot" class="weight-control">
                 <span>{{ slot === 'morning' ? '早上' : '晚上' }}</span>
                 <div class="number-control">
                   <input
                     v-model.number="values[`${component.id}:${slot}`]"
                     type="number"
+                    min="0"
                     :step="1 / (10 ** component.decimalPlaces)"
                     placeholder="未填写"
                     @input="updateValue(component, slot)"
@@ -742,7 +1040,7 @@ onBeforeUnmount(() => {
               />
               <span>{{ component.unit }}</span>
             </div>
-            <div v-if="component.type !== 'weight'" class="number-meta">
+            <div v-if="component.type === 'number'" class="number-meta">
               <span>{{ component.decimalPlaces }} 位小数</span>
               <span v-if="component.minValue !== null || component.maxValue !== null">范围 {{ component.minValue ?? '不限' }}～{{ component.maxValue ?? '不限' }}</span>
               <span v-if="component.required" class="required-mark">必填</span>
@@ -756,18 +1054,36 @@ onBeforeUnmount(() => {
       <button v-if="!rightOpen" class="rail-button" title="展开统计栏" @click="rightOpen = true">‹</button>
       <template v-else>
         <header class="stats-header"><div><span class="section-label">数据回顾</span><h2>变化与趋势</h2></div><button class="icon-button" title="收起统计栏" @click="rightOpen = false">›</button></header>
-        <div class="range-tabs"><button v-for="range in ['7天','30天','90天']" :key="range" :class="{ active: chartRange === range }" @click="chartRange = range">{{ range }}</button></div>
-
         <div class="stats-scroll">
           <article v-for="component in chartComponents" :key="component.id" class="chart-card">
             <div class="chart-title">
               <div><span class="color-dot" :style="{ background: component.color }"></span><strong>{{ component.label }}</strong></div>
               <div class="chart-actions">
                 <button class="icon-button" :title="collapsedCharts[component.id] ? '展开图表' : '最小化图表'" @click="collapsedCharts[component.id] = !collapsedCharts[component.id]">{{ collapsedCharts[component.id] ? '□' : '−' }}</button>
-                <button class="icon-button" title="放大查看细节" @click="expandedChartId = component.id">⛶</button>
+                <div v-if="component.type === 'learning'" class="learning-month-control" :title="`选择${component.label}的统计月份`">
+                  <span>{{ learningMonthDisplay(component) }}</span><input type="month" :value="learningMonthKey(component)" @change="handleLearningMonthInput(component, $event)" />
+                </div>
+                <div v-else class="chart-range-control">
+                  <button class="chart-range-button" title="设置这张图表的统计时间" @click="chartRangeMenuOpen = chartRangeMenuOpen === component.id ? null : component.id">{{ componentChartRange(component) }}</button>
+                  <div v-if="chartRangeMenuOpen === component.id" class="chart-range-menu">
+                    <button v-for="range in (['7天', '30天', '90天'] as const)" :key="range" :class="{ active: componentChartRange(component) === range }" @click="setComponentChartRange(component, range)">{{ range }}</button>
+                  </div>
+                </div>
+                <button class="icon-button" title="放大查看细节" @click="openExpandedChart(component.id)">⛶</button>
               </div>
             </div>
             <template v-if="!collapsedCharts[component.id]">
+            <div v-if="component.type === 'learning'" class="learning-heat-summary">
+              <div class="metric-row"><div><small>本月学习</small><strong>{{ learningMonthTotal(component) }}<small>分钟</small></strong></div><span>{{ (learningHeatmaps[component.id] ?? []).reduce((sum, day) => sum + day.entryCount, 0) }} 条记录</span></div>
+              <div class="mini-heat-weekdays"><span v-for="weekday in ['一','二','三','四','五','六','日']" :key="weekday">{{ weekday }}</span></div>
+              <div class="mini-heat-calendar">
+                <div v-for="cell in learningCalendarCells(component)" :key="cell.key" :class="['mini-heat-day', `level-${heatLevel(cell.summary?.totalMinutes ?? 0)}`, { blank: cell.day === null }]">
+                  <span v-if="cell.day !== null">{{ cell.day }}</span>
+                </div>
+              </div>
+              <div class="heat-legend"><span>少</span><i v-for="level in 5" :key="level" :class="`level-${level}`"></i><span>多</span></div>
+            </div>
+            <template v-else>
             <div class="metric-row"><div><small>{{ statisticLabels[component.statistic] }}</small><strong>{{ displayMetric(component) }}<small>{{ component.unit }}</small></strong></div><span>↘ 0.6%</span></div>
             <div v-if="component.type === 'weight'" class="weight-chart-tools">
               <button :class="{ off: !weightCurveVisible.morning }" @click="toggleWeightCurve('morning')"><i class="morning-dot"></i>早上</button>
@@ -789,7 +1105,8 @@ onBeforeUnmount(() => {
               <rect v-for="(height, barIndex) in barHeights(component.id)" :key="barIndex" :x="8 + barIndex * 24" :y="75 - height" width="14" :height="height" rx="3" :fill="component.color" opacity=".78" />
             </svg>
             <div v-else class="empty-chart">保存几天记录后，这里会出现趋势</div>
-            <div class="chart-axis"><span>8月19日</span><span>今天</span></div>
+            <div class="chart-axis"><span>{{ chartStartLabel(component) }}</span><span>{{ formatDateKey(selectedDate) === formatDateKey(new Date()) ? '今天' : selectedDateLabel }}</span></div>
+            </template>
             </template>
           </article>
           <div class="insight-card"><span>✦</span><div><strong>数值趋势</strong><p>所有统计均来自数值组件，可在模板中调整图表类型与统计指标。</p></div></div>
@@ -808,18 +1125,41 @@ onBeforeUnmount(() => {
       </section>
     </div>
 
-    <div v-if="expandedComponent" class="modal-backdrop" @click.self="expandedChartId = null">
+    <div v-if="expandedComponent" class="modal-backdrop" @click.self="closeExpandedChart">
       <section class="chart-detail-modal">
         <header>
-          <div><span class="eyebrow">详细统计 · {{ chartRange }}</span><h2>{{ expandedComponent.label }}</h2><p>每个圆点代表当天的一次有效记录。</p></div>
-          <button class="close-button" @click="expandedChartId = null">×</button>
+          <div><span class="eyebrow">详细统计 · {{ expandedComponent.type === 'learning' ? sampleCalendarMonthLabel : componentChartRange(expandedComponent) }}</span><h2>{{ expandedComponent.label }}</h2><p>{{ expandedComponent.type === 'learning' ? '选择日期查看当天的全部学习记录。' : '每个圆点代表当天的一次有效记录。' }}</p></div>
+          <button class="close-button" @click="closeExpandedChart">×</button>
         </header>
+        <div v-if="expandedComponent.type === 'learning'" class="learning-detail-view">
+          <div class="learning-detail-nav sample-calendar-nav">
+            <button title="上个月" :disabled="sampleCalendarLoading" @click="changeExpandedLearningMonth(-1)">‹</button>
+            <span>{{ sampleCalendarLoading ? '正在读取…' : sampleCalendarMonthLabel }}</span>
+            <button title="下个月" :disabled="sampleCalendarLoading" @click="changeExpandedLearningMonth(1)">›</button>
+          </div>
+          <div class="learning-detail-weekdays"><span v-for="weekday in ['一','二','三','四','五','六','日']" :key="weekday">{{ weekday }}</span></div>
+          <div :class="['learning-detail-calendar', { loading: sampleCalendarLoading }]">
+            <button v-for="cell in learningCalendarCells(expandedComponent, true)" :key="cell.key" :disabled="cell.day === null" :class="['learning-detail-day', { blank: cell.day === null, selected: cell.date === selectedLearningDetailDate, recorded: cell.entries.length }]" @click="selectedLearningDetailDate = cell.date">
+              <small v-if="cell.day !== null">{{ cell.day }} 日</small>
+              <div v-if="cell.entries.length" class="learning-day-logos"><span v-for="(entry, index) in cell.entries.slice(0, 6)" :key="`${entry.id}-${index}`">{{ entry.logo }}</span><b v-if="cell.entries.length > 6">+{{ cell.entries.length - 6 }}</b></div>
+              <span v-else-if="cell.day !== null" class="learning-no-entry">—</span>
+            </button>
+          </div>
+          <section v-if="selectedLearningDetailDate" class="learning-day-detail">
+            <header><div><span class="section-label">当日所学</span><h3>{{ selectedLearningDetailDate }}</h3></div><strong>{{ selectedLearningDetails().reduce((sum, entry) => sum + (entry.durationMinutes ?? 0), 0) }} 分钟</strong></header>
+            <div v-if="selectedLearningDetails().length" class="learning-history-list">
+              <article v-for="entry in selectedLearningDetails()" :key="entry.id ?? entry.clientId"><span>{{ entry.logo }}</span><div><strong>{{ entry.tag }}</strong><small>{{ entry.durationMinutes }} 分钟</small><p>{{ entry.knowledge || '未记录具体知识点' }}</p></div></article>
+            </div>
+            <p v-else class="detail-empty-learning">这一天没有有效的学习记录。</p>
+          </section>
+        </div>
+        <template v-else>
         <div v-if="expandedComponent.type === 'weight'" class="detail-legend weight-chart-tools">
           <button :class="{ off: !weightCurveVisible.morning }" @click="toggleWeightCurve('morning')"><i class="morning-dot"></i>早上</button>
           <button :class="{ off: !weightCurveVisible.evening }" @click="toggleWeightCurve('evening')"><i class="evening-dot"></i>晚上</button>
         </div>
         <div v-if="detailRows(expandedComponent).length" class="detail-chart-wrap">
-          <svg class="detail-chart" viewBox="0 0 720 330">
+          <svg class="detail-chart interactive-chart" viewBox="0 0 720 330" @mousemove="updateChartHover(expandedComponent, $event)" @mouseleave="hoveredChartDate = null">
             <g v-for="tick in detailTicks(expandedComponent)" :key="tick.y">
               <line x1="55" x2="680" :y1="tick.y" :y2="tick.y" class="detail-grid-line" />
               <text x="47" :y="tick.y + 4" text-anchor="end" class="detail-axis-label">{{ tick.value.toFixed(expandedComponent.decimalPlaces) }}</text>
@@ -848,18 +1188,49 @@ onBeforeUnmount(() => {
               <text :x="point.x" :y="point.y - 23" text-anchor="middle" class="extreme-value-label evening-value-label">{{ point.displayValue.toFixed(expandedComponent.decimalPlaces) }}</text>
             </g>
             <text v-for="item in detailDatePositions(expandedComponent)" :key="item.date" :x="item.x" y="292" text-anchor="middle" class="detail-date-label">{{ shortDate(item.date) }}</text>
+            <g v-if="hoveredChartDate" class="hover-selection">
+              <line :x1="hoveredDateX(expandedComponent)" :x2="hoveredDateX(expandedComponent)" y1="54" y2="270" class="hover-guide" />
+              <text :x="hoveredDateX(expandedComponent)" y="43" text-anchor="middle" class="hover-date-label">{{ hoveredChartDate }}</text>
+              <g v-for="(point, hoverIndex) in hoveredSamplePoints(expandedComponent)" :key="`hover-${point.slot}-${point.date}`">
+                <circle :cx="point.x" :cy="point.y" r="13" :fill="point.color" class="hover-halo" />
+                <circle :cx="point.x" :cy="point.y" r="6" fill="#fffdfa" :stroke="point.color" stroke-width="3" class="hover-core" />
+                <text :x="point.x" :y="point.y - 15 - hoverIndex * 13" text-anchor="middle" class="hover-value-label" :fill="point.color">{{ point.label }} {{ point.displayValue.toFixed(expandedComponent.decimalPlaces) }} {{ expandedComponent.unit }}</text>
+              </g>
+            </g>
             <text x="18" y="34" class="detail-unit-label">单位：{{ expandedComponent.unit }}</text>
           </svg>
         </div>
         <div v-else class="detail-empty">当前日期范围内还没有记录</div>
         <div v-if="detailRows(expandedComponent).length" class="sample-list">
-          <div class="sample-list-head"><strong>全部采样点</strong><span>{{ detailRows(expandedComponent).length }} 条</span></div>
-          <div class="sample-grid">
-            <div v-for="(row, index) in detailRows(expandedComponent)" :key="`${row.date}-${row.slot}-${index}`" class="sample-item">
-              <span>{{ row.date }}</span><small>{{ row.slot }}</small><strong>{{ displayPointValue(expandedComponent, row.value).toFixed(expandedComponent.decimalPlaces) }} {{ expandedComponent.unit }}</strong>
+          <div class="sample-list-head">
+            <strong>全部采样点</strong>
+            <div class="sample-calendar-nav">
+              <button title="上个月" :disabled="sampleCalendarLoading" @click="changeSampleCalendarMonth(-1)">‹</button>
+              <span>{{ sampleCalendarLoading ? '正在读取…' : sampleCalendarMonthLabel }}</span>
+              <button title="下个月" :disabled="sampleCalendarLoading" @click="changeSampleCalendarMonth(1)">›</button>
             </div>
           </div>
+          <div :class="['curve-calendars', { loading: sampleCalendarLoading }]">
+            <section v-for="curve in curveCalendars(expandedComponent)" :key="curve.slot" class="curve-calendar" :style="{ '--curve-color': curve.color }">
+              <header><span class="curve-dot"></span><strong>{{ curve.label }}</strong><small>{{ curve.sampleCount }} 个采样</small></header>
+              <div class="calendar-months">
+                <article class="sample-month">
+                  <div class="sample-weekdays"><span v-for="weekday in ['一','二','三','四','五','六','日']" :key="weekday">{{ weekday }}</span></div>
+                  <div class="sample-calendar-grid">
+                    <div v-for="cell in curve.cells" :key="cell.key" :class="['sample-day', { blank: cell.day === null, recorded: cell.value !== null }]">
+                      <template v-if="cell.day !== null">
+                        <small>{{ cell.day }} 日</small>
+                        <strong v-if="cell.value !== null">{{ cell.value.toFixed(expandedComponent.decimalPlaces) }}<em>{{ expandedComponent.unit }}</em></strong>
+                        <span v-else>—</span>
+                      </template>
+                    </div>
+                  </div>
+                </article>
+              </div>
+            </section>
+          </div>
         </div>
+        </template>
       </section>
     </div>
 
@@ -872,13 +1243,19 @@ onBeforeUnmount(() => {
           <article v-for="(component, index) in templateDraft" :key="component.id" class="editor-item numeric-editor-item">
             <div class="editor-item-main">
               <span class="drag-handle">⠿</span>
-              <span class="component-badge" :style="{ background: component.color + '22', color: component.color }">{{ component.type === 'weight' ? '秤' : '123' }}</span>
-              <div class="editor-fields"><input v-model="component.label" placeholder="记录名称" /><small>{{ component.type === 'weight' ? '体重组件' : '数值组件' }} · {{ component.hint }}</small></div>
-              <label v-if="component.type !== 'weight'" class="chart-toggle"><input v-model="component.chart" type="checkbox" /><span></span>统计</label>
+              <span class="component-badge" :style="{ background: component.color + '22', color: component.color }">{{ component.type === 'weight' ? '秤' : component.type === 'learning' ? '学' : '123' }}</span>
+              <div class="editor-fields"><input v-model="component.label" placeholder="记录名称" /><small>{{ component.type === 'weight' ? '体重组件' : component.type === 'learning' ? '学习记录组件' : '数值组件' }} · {{ component.hint }}</small></div>
+              <label v-if="component.type === 'number'" class="chart-toggle"><input v-model="component.chart" type="checkbox" /><span></span>统计</label>
               <div class="move-buttons"><button :disabled="index === 0" @click="moveComponent(index, -1)">↑</button><button :disabled="index === templateDraft.length - 1" @click="moveComponent(index, 1)">↓</button></div>
               <button class="delete-button" @click="removeComponent(index)">×</button>
             </div>
-            <div v-if="component.type === 'weight'" class="number-settings weight-settings">
+            <div v-if="component.type === 'learning'" class="number-settings weight-settings">
+              <div class="fixed-setting"><span>每日记录</span><strong>可添加多条</strong></div>
+              <div class="fixed-setting"><span>时长规则</span><strong>1–1439 分钟</strong></div>
+              <div class="fixed-setting"><span>Tag</span><strong>必填 · 20 字</strong></div>
+              <div class="fixed-setting"><span>统计图</span><strong>月历热力图</strong></div>
+            </div>
+            <div v-else-if="component.type === 'weight'" class="number-settings weight-settings">
               <label><span>单位</span><select v-model="component.unit"><option value="kg">kg</option><option value="斤">斤</option></select></label>
               <div class="fixed-setting"><span>记录时段</span><strong>早上 + 晚上</strong></div>
               <div class="fixed-setting"><span>填写规则</span><strong>均为选填</strong></div>
@@ -898,6 +1275,7 @@ onBeforeUnmount(() => {
         </div>
         <button class="add-component" @click="catalogOpen = !catalogOpen">＋ 添加组件</button>
         <div v-if="catalogOpen" class="catalog-grid">
+          <button @click="addLearningComponent"><span>学</span><div><strong>今日所学</strong><small>多条学习记录、Tag、时长与热力图</small></div></button>
           <button @click="addWeightComponent"><span>秤</span><div><strong>体重</strong><small>早晚双数值、kg/斤换算、双曲线</small></div></button>
           <button @click="addNumberComponent"><span>123</span><div><strong>自定义数值</strong><small>配置单位、精度、范围与统计图表</small></div></button>
         </div>
@@ -973,6 +1351,8 @@ button { color: inherit; }
 .rating-row { display: grid; grid-template-columns: repeat(5, 1fr); gap: 7px; }.rating-row button { border: 1px solid #e5e4de; border-radius: 10px; background: #fafaf7; padding: 7px 3px; font-size: 8px; color: #929893; cursor: pointer; }.rating-row button span { display: block; font-size: 19px; line-height: 20px; color: #9ca5a0; }.rating-row button:hover, .rating-row button.active { border-color: #d1a46f; color: #8e6944; background: #fbf2e7; }.rating-row button.active span { color: #d49d5d; }
 .number-control { display: flex; align-items: baseline; border-bottom: 1px solid #d9d9d3; width: 180px; }.number-control input { width: 125px; border: 0; outline: 0; background: transparent; color: #3b4742; font-family: "Noto Serif SC", serif; font-size: 27px; font-weight: 600; }.number-control span { color: #9aa09c; font-size: 11px; }
 .weight-controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }.weight-control > span { display: block; margin-bottom: 7px; color: #7d8882; font-size: 9px; }.weight-control .number-control { width: 100%; }.weight-control .number-control input { width: 100%; min-width: 0; }.weight-chart-tools { display: flex; gap: 6px; margin: 7px 0 3px; }.weight-chart-tools button { display: flex; align-items: center; gap: 5px; border: 1px solid #dedfd9; border-radius: 20px; padding: 3px 8px; background: white; color: #68736e; font-size: 8px; cursor: pointer; }.weight-chart-tools button.off { opacity: .4; }.weight-chart-tools i { width: 7px; height: 7px; border-radius: 50%; }.morning-dot { background: #729b8b; }.evening-dot { background: #d09a72; }
+.weight-control input[type="number"] { appearance: textfield; -moz-appearance: textfield; }.weight-control input[type="number"]::-webkit-inner-spin-button, .weight-control input[type="number"]::-webkit-outer-spin-button { margin: 0; -webkit-appearance: none; }
+.learning-records { display: grid; gap: 10px; }.learning-entry-card { position: relative; padding: 13px; border: 1px solid #dde4df; border-radius: 12px; background: #fafcf9; }.learning-entry-card.invalid { border-color: #eadbd4; }.learning-alpha { display: grid; grid-template-columns: 64px minmax(150px, 1fr) 118px 24px; align-items: end; gap: 10px; }.learning-alpha label > span, .learning-beta > span { display: block; margin-bottom: 5px; color: #858f8a; font-size: 8px; }.learning-alpha label > span em, .learning-beta > span em { color: #aaa; font-style: normal; }.learning-logo select, .learning-tag input, .learning-duration input { width: 100%; height: 34px; border: 1px solid #dddeda; border-radius: 8px; outline: 0; background: white; color: #4f5b55; }.learning-logo select { font-size: 18px; text-align: center; }.learning-tag input { padding: 0 9px; font-size: 10px; }.learning-duration > div { display: flex; align-items: center; height: 34px; border: 1px solid #dddeda; border-radius: 8px; background: white; }.learning-duration input { min-width: 0; border: 0; background: transparent; padding: 0 7px; }.learning-duration b { padding-right: 7px; color: #919894; font-size: 8px; font-weight: 400; }.learning-alpha input:focus, .learning-alpha select:focus, .learning-beta textarea:focus { border-color: #8da79b; }.learning-delete { width: 24px; height: 34px; border: 0; background: transparent; color: #a8aeaa; cursor: pointer; font-size: 18px; }.learning-delete:hover { color: #b56856; }.learning-beta { display: block; margin-top: 11px; }.learning-beta textarea { width: 100%; resize: vertical; min-height: 82px; border: 1px solid #dddeda; border-radius: 9px; outline: 0; padding: 9px 10px; background: white; color: #53605a; font-size: 10px; line-height: 1.65; }.learning-validation { display: block; margin-top: 7px; color: #ad705f; font-size: 8px; }.learning-index { position: absolute; top: 9px; right: 12px; color: #c0c4c1; font-size: 7px; }.add-learning-entry { width: 100%; border: 1px dashed #9fb2a9; border-radius: 10px; padding: 9px; background: #f3f7f4; color: #5f7c70; cursor: pointer; font-size: 9px; }.add-learning-entry:hover { background: #eaf2ed; }
 .number-meta { display: flex; gap: 10px; margin-top: 9px; color: #9aa09c; font-size: 8px; }.number-meta span { padding-right: 10px; border-right: 1px solid #e4e3dd; }.number-meta span:last-child { border-right: 0; }.number-meta .required-mark { color: #a87868; }
 .toggle-control { display: grid; grid-template-columns: 38px 1fr; text-align: left; align-items: center; column-gap: 10px; border: 0; background: transparent; padding: 0; cursor: pointer; }.toggle-control strong { font-size: 11px; }.toggle-control small { grid-column: 2; color: #a0a49f; font-size: 9px; }.switch { grid-row: span 2; width: 37px; height: 21px; border-radius: 20px; background: #dadbd6; padding: 3px; transition: .2s; }.switch i { display: block; width: 15px; height: 15px; border-radius: 50%; background: white; box-shadow: 0 1px 4px #0002; transition: .2s; }.toggle-control.on .switch { background: #77988c; }.toggle-control.on .switch i { transform: translateX(16px); }
 .textarea-wrap { position: relative; }.textarea-wrap textarea, .text-input { width: 100%; resize: vertical; min-height: 88px; border: 1px solid #e5e4de; outline: 0; border-radius: 10px; padding: 11px 12px 22px; background: #fafaf7; color: #56605b; font-size: 11px; line-height: 1.8; }.text-input { min-height: 0; padding: 10px 12px; }.textarea-wrap textarea:focus, .text-input:focus { border-color: #9cb2aa; background: #fff; }.textarea-wrap span { position: absolute; right: 9px; bottom: 8px; color: #aeb1ad; font-size: 8px; }.choice-row { display: flex; gap: 8px; flex-wrap: wrap; }.choice-row button { border: 1px solid #dfdfd9; background: #fafaf7; border-radius: 9px; padding: 8px 14px; cursor: pointer; font-size: 10px; }.choice-row button.active { background: #e9f0ed; border-color: #83a094; color: #527267; }.bottom-save { display: block; margin: 20px 0 0 auto; }
@@ -983,7 +1363,13 @@ button { color: inherit; }
 .metric-row { align-items: flex-end; }.metric-row > div > small { display: block; margin-bottom: 1px; color: #9ba09d; font-size: 7px; }.metric-row strong { display: block; }.metric-row strong small { display: inline; }.numeric-editor-item { display: block; padding: 0; overflow: hidden; }.editor-item-main { display: flex; align-items: center; gap: 10px; padding: 10px; }.number-settings { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 9px; padding: 12px 14px 14px 51px; border-top: 1px solid #ecebe6; background: #fafaf7; }.number-settings label { min-width: 0; }.number-settings label > span { display: block; margin-bottom: 4px; color: #929995; font-size: 8px; }.number-settings input, .number-settings select { width: 100%; height: 30px; border: 1px solid #deded8; border-radius: 7px; outline: 0; padding: 0 8px; background: white; color: #56605b; font-size: 9px; }.number-settings input:focus, .number-settings select:focus { border-color: #8da69c; }.required-setting button { width: 100%; height: 30px; border: 1px solid #deded8; border-radius: 7px; background: white; color: #8c938f; cursor: pointer; font-size: 9px; }.required-setting button.active { border-color: #c69c88; background: #f8eee9; color: #a36f58; }
 .empty-chart { display: grid; place-items: center; height: 78px; margin-top: 5px; border-radius: 9px; background: #f2f1ed; color: #a4aaa6; font-size: 8px; }
 .chart-actions { display: flex; gap: 2px !important; }.chart-actions button { width: 25px; height: 25px; border-radius: 7px; font-size: 14px; }.chart-card:has(> .chart-title + template) { padding-bottom: 14px; }
+.chart-range-control { position: relative; }.chart-actions .chart-range-button { width: auto; min-width: 38px; padding: 0 5px; border: 0; background: transparent; color: #77827d; cursor: pointer; font-size: 8px; }.chart-actions .chart-range-button:hover { background: #eceeea; color: #52675e; }.chart-range-menu { position: absolute; z-index: 20; top: 29px; left: 50%; width: 62px; padding: 4px; transform: translateX(-50%); border: 1px solid #dcddd7; border-radius: 9px; background: #fffefa; box-shadow: 0 9px 24px #34413a20; }.chart-actions .chart-range-menu button { width: 100%; height: auto; border: 0; border-radius: 6px; padding: 6px 4px; background: transparent; color: #78817d; cursor: pointer; font-size: 8px; }.chart-actions .chart-range-menu button:hover { background: #edf1ee; }.chart-actions .chart-range-menu button.active { background: #e4ece8; color: #4e6b60; font-weight: 700; }
+.learning-month-control { position: relative; min-width: 54px; height: 25px; display: grid !important; place-items: center; border-radius: 7px; color: #68766f; font-size: 7px; overflow: hidden; }.learning-month-control:hover { background: #eceeea; }.learning-month-control input { position: absolute; inset: 0; width: 100%; opacity: 0; cursor: pointer; }.mini-heat-weekdays, .mini-heat-calendar { display: grid; grid-template-columns: repeat(7, 1fr); gap: 3px; }.mini-heat-weekdays { margin: 8px 0 3px; color: #a4aaa6; text-align: center; font-size: 6px; }.mini-heat-day { aspect-ratio: 1; display: grid; place-items: center; border-radius: 4px; background: #eceee8; color: #75817b; font-size: 6px; }.mini-heat-day.blank { background: transparent; }.mini-heat-day.level-1, .heat-legend .level-1 { background: #dcebe2; }.mini-heat-day.level-2, .heat-legend .level-2 { background: #bbd7c7; }.mini-heat-day.level-3, .heat-legend .level-3 { background: #8fbea4; color: white; }.mini-heat-day.level-4, .heat-legend .level-4 { background: #5f9d7a; color: white; }.mini-heat-day.level-5, .heat-legend .level-5 { background: #347455; color: white; }.heat-legend { display: flex; justify-content: flex-end; align-items: center; gap: 3px; margin-top: 7px; color: #a0a5a2; font-size: 6px; }.heat-legend i { width: 9px; height: 9px; border-radius: 2px; }
 .chart-detail-modal { width: min(900px, 92vw); max-height: 90vh; overflow-y: auto; border: 1px solid #e3e1da; border-radius: 18px; background: #fbfaf7; box-shadow: 0 24px 80px #29332d42; }.chart-detail-modal > header { display: flex; justify-content: space-between; align-items: flex-start; padding: 24px 28px 16px; border-bottom: 1px solid #e6e4dd; }.chart-detail-modal h2 { margin: 5px 0 3px; font-family: "Noto Serif SC", serif; font-size: 22px; }.chart-detail-modal header p { margin: 0; color: #929995; font-size: 9px; }.detail-legend { margin: 14px 28px 0; }.detail-chart-wrap { padding: 8px 22px 0; overflow-x: auto; }.detail-chart { display: block; width: 100%; min-width: 650px; height: 350px; }.detail-grid-line { stroke: #e4e4de; stroke-width: 1; }.detail-axis-line { stroke: #aeb4b0; stroke-width: 1.2; }.detail-axis-label, .detail-date-label, .detail-unit-label { fill: #8d9590; font-family: "Noto Sans SC", sans-serif; font-size: 9px; }.detail-date-label { font-size: 8px; }.detail-unit-label { font-size: 10px; }.extreme-value-label { fill: #53675f; font-family: "Noto Sans SC", sans-serif; font-size: 10px; font-weight: 700; paint-order: stroke; stroke: #fbfaf7; stroke-width: 4px; stroke-linejoin: round; }.morning-value-label { fill: #537d6e; }.evening-value-label { fill: #af7048; }.detail-empty { display: grid; place-items: center; height: 300px; color: #a0a6a2; font-size: 11px; }.sample-list { margin: 0 28px 26px; border-top: 1px solid #e6e4dd; padding-top: 16px; }.sample-list-head { display: flex; justify-content: space-between; margin-bottom: 10px; font-size: 10px; }.sample-list-head span { color: #929995; }.sample-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; max-height: 180px; overflow-y: auto; }.sample-item { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; padding: 9px 10px; border: 1px solid #e6e4de; border-radius: 9px; background: white; }.sample-item span { font-size: 9px; }.sample-item small { color: #929995; font-size: 8px; }.sample-item strong { grid-column: 1 / -1; color: #52675f; font-family: "Noto Serif SC", serif; font-size: 13px; }
+.interactive-chart { cursor: crosshair; }.hover-guide { stroke: #8fa39a; stroke-width: 1.2; stroke-dasharray: 4 4; opacity: .8; pointer-events: none; }.hover-date-label, .hover-value-label { font-family: "Noto Sans SC", sans-serif; font-weight: 700; paint-order: stroke; stroke: #fbfaf7; stroke-width: 5px; stroke-linejoin: round; pointer-events: none; }.hover-date-label { fill: #53645d; font-size: 10px; }.hover-value-label { font-size: 10px; }.hover-halo { opacity: .18; transform-box: fill-box; transform-origin: center; animation: sample-pulse 1.25s ease-out infinite; pointer-events: none; }.hover-core { filter: drop-shadow(0 2px 4px #34413a38); pointer-events: none; }@keyframes sample-pulse { 0% { transform: scale(.65); opacity: .32; } 70%, 100% { transform: scale(1.35); opacity: 0; } }
+.curve-calendars { display: grid; gap: 14px; }.curve-calendar { --curve-color: #729b8b; padding: 14px; border: 1px solid #e2e2dc; border-radius: 13px; background: #f8f8f4; }.curve-calendar > header { display: flex; align-items: center; gap: 7px; margin-bottom: 13px; }.curve-calendar > header .curve-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--curve-color); }.curve-calendar > header strong { font-size: 11px; }.curve-calendar > header small { margin-left: auto; color: #989f9b; font-size: 8px; }.calendar-months { display: grid; grid-template-columns: repeat(auto-fit, minmax(225px, 1fr)); gap: 12px; }.sample-month { min-width: 0; padding: 11px; border: 1px solid #e8e7e1; border-radius: 10px; background: #fffefa; }.sample-month h3 { margin: 0 0 9px; color: #5e6964; font-family: "Noto Serif SC", serif; font-size: 10px; text-align: center; }.sample-weekdays, .sample-calendar-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 3px; }.sample-weekdays { margin-bottom: 4px; color: #a5aaa7; text-align: center; font-size: 7px; }.sample-day { min-width: 0; min-height: 45px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; border: 1px solid #ecebe6; border-radius: 7px; background: #fafaf7; }.sample-day small { color: #a9aeaa; font-size: 7px; font-weight: 400; }.sample-day strong { max-width: 100%; color: #4c5b55; font-family: "Noto Serif SC", serif; font-size: 10px; line-height: 1; white-space: nowrap; }.sample-day strong em { margin-left: 1px; color: #8d9691; font-family: "Noto Sans SC", sans-serif; font-size: 6px; font-style: normal; font-weight: 400; }.sample-day > span { color: #c6c9c6; font-size: 9px; }.sample-day.recorded { border-color: color-mix(in srgb, var(--curve-color) 34%, #e7e6df); background: color-mix(in srgb, var(--curve-color) 8%, #fffefa); box-shadow: inset 0 2px 0 color-mix(in srgb, var(--curve-color) 60%, transparent); }.sample-day.blank { border-color: transparent; background: transparent; }.sample-day.outside { opacity: .28; background: transparent; }.sample-day.outside strong, .sample-day.outside span { display: none; }
+.sample-list-head { position: relative; align-items: center; justify-content: flex-start; min-height: 25px; }.sample-calendar-nav { position: absolute; left: 50%; transform: translateX(-50%); display: grid; grid-template-columns: 25px 104px 25px; align-items: center; gap: 4px; }.sample-calendar-nav button { width: 25px; height: 25px; border: 1px solid #dbddd7; border-radius: 7px; background: #fffefa; color: #64726c; cursor: pointer; font-size: 16px; line-height: 1; }.sample-calendar-nav button:hover { border-color: #91a69d; background: #edf2ef; }.sample-calendar-nav button:disabled { cursor: wait; opacity: .45; }.sample-calendar-nav span { color: #64706a; text-align: center; font-family: "Noto Serif SC", serif; font-size: 9px; }.curve-calendars { transition: opacity .18s ease; }.curve-calendars.loading { opacity: .45; pointer-events: none; }
+.learning-detail-view { padding: 18px 28px 28px; }.learning-detail-nav { position: relative; left: auto; transform: none; width: max-content; margin: 0 auto 14px; }.learning-detail-weekdays, .learning-detail-calendar { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 6px; }.learning-detail-weekdays { margin-bottom: 5px; color: #a0a6a2; text-align: center; font-size: 8px; }.learning-detail-calendar { transition: opacity .18s; }.learning-detail-calendar.loading { opacity: .4; pointer-events: none; }.learning-detail-day { min-height: 82px; display: flex; flex-direction: column; align-items: flex-start; gap: 7px; border: 1px solid #e5e5df; border-radius: 10px; padding: 8px; background: #fffefa; color: #5d6963; cursor: pointer; text-align: left; }.learning-detail-day:hover { border-color: #9db4a8; background: #f3f7f4; }.learning-detail-day.selected { border-color: #668c7b; box-shadow: 0 0 0 2px #729b8b22; }.learning-detail-day.recorded { background: #f6faf7; }.learning-detail-day.blank { visibility: hidden; }.learning-detail-day small { color: #a5aaa7; font-size: 8px; }.learning-day-logos { display: flex; flex-wrap: wrap; gap: 3px; font-size: 15px; }.learning-day-logos b { display: grid; place-items: center; min-width: 21px; height: 21px; border-radius: 10px; background: #e6ece8; color: #6d7f76; font-size: 7px; }.learning-no-entry { align-self: center; color: #d0d2cf; }.learning-day-detail { margin-top: 18px; padding-top: 16px; border-top: 1px solid #e4e3dd; }.learning-day-detail > header { display: flex; justify-content: space-between; align-items: center; }.learning-day-detail h3 { margin: 4px 0 0; font-family: "Noto Serif SC", serif; font-size: 15px; }.learning-day-detail > header > strong { color: #5c796c; font-size: 10px; }.learning-history-list { display: grid; gap: 8px; margin-top: 12px; }.learning-history-list article { display: grid; grid-template-columns: 38px 1fr; gap: 10px; padding: 11px; border: 1px solid #e4e4de; border-radius: 10px; background: white; }.learning-history-list article > span { display: grid; place-items: center; width: 36px; height: 36px; border-radius: 10px; background: #edf3ef; font-size: 20px; }.learning-history-list strong { font-size: 10px; }.learning-history-list small { margin-left: 8px; color: #819087; font-size: 8px; }.learning-history-list p { margin: 6px 0 0; color: #737d78; white-space: pre-wrap; font-size: 9px; line-height: 1.6; }.detail-empty-learning { padding: 25px; color: #a2a7a4; text-align: center; font-size: 9px; }
 .editor-error { margin: -7px 28px 14px; padding: 9px 11px; border: 1px solid #e2b9ac; border-radius: 9px; background: #fff1ed; color: #a45f4d; font-size: 9px; }.template-editor button:disabled { cursor: wait; opacity: .55; }
 @media (max-width: 1120px) { .app-shell { --right: 300px; --left: 250px; }.record-header, .record-scroll { padding-left: 28px; padding-right: 28px; }.number-settings { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 </style>

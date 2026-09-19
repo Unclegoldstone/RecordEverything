@@ -6,7 +6,7 @@ export type StatisticType = "latest" | "average" | "min" | "max" | "change";
 export interface NumberComponent {
   databaseId: number | null;
   id: string;
-  type: "number" | "weight";
+  type: "number" | "weight" | "learning";
   label: string;
   hint: string;
   unit: string;
@@ -26,6 +26,7 @@ export interface LoadedDay {
   components: NumberComponent[];
   values: Record<string, number | null>;
   touched: Record<string, boolean>;
+  learningEntries: Record<string, LearningEntry[]>;
   hasRecord: boolean;
 }
 
@@ -35,8 +36,9 @@ interface ComponentRow {
   id: number; stable_id: string; name: string; unit: string;
   decimal_places: number; default_value: number | null; required: number;
   min_value: number | null; max_value: number | null; chart_enabled: number;
-  chart_type: ChartType; statistic: StatisticType; color: string; component_kind: "number" | "weight";
+  chart_type: ChartType; statistic: StatisticType; color: string; component_kind: "number" | "weight"; sort_order: number;
 }
+interface LearningComponentRow { id: number; stable_id: string; name: string; sort_order: number }
 interface ValueRow { stable_id: string; value: number; measurement_slot: "single" | "morning" | "evening" }
 interface DateRow { record_date: string }
 interface SeriesRow { value: number; record_date: string; measurement_slot: "single" | "morning" | "evening" }
@@ -44,6 +46,10 @@ export interface SeriesPoint { date: string; value: number }
 export interface ComponentSeries { single: SeriesPoint[]; morning: SeriesPoint[]; evening: SeriesPoint[] }
 export interface TodoItem { id: number; content: string; completed: boolean }
 interface TodoRow { id: number; content: string; completed: number }
+export interface LearningEntry { id: number | null; clientId: string; logo: string; tag: string; durationMinutes: number | null; knowledge: string }
+interface LearningEntryRow { id: number; stable_id: string; logo: string; tag: string; duration_minutes: number | null; knowledge: string; sort_order: number; record_date?: string }
+export interface LearningDaySummary { date: string; totalMinutes: number; logos: string[]; entryCount: number }
+export interface LearningHistoryEntry extends LearningEntry { date: string }
 
 export const DATABASE_URL = "sqlite:record-everything.db";
 let databasePromise: Promise<Database> | null = null;
@@ -68,8 +74,10 @@ export async function closeDatabase(): Promise<void> {
 export async function clearAllData(): Promise<void> {
   const database = await getDatabase();
   await database.execute("DELETE FROM number_values");
+  await database.execute("DELETE FROM learning_entries");
   await database.execute("DELETE FROM daily_records");
   await database.execute("DELETE FROM number_components");
+  await database.execute("DELETE FROM learning_components");
   await database.execute("DELETE FROM template_versions");
   await database.execute("DELETE FROM global_todos");
 }
@@ -83,7 +91,10 @@ export async function initializeDatabase(today: string): Promise<void> {
   }
   const versionId = Number(versions[0].id);
   const componentCount = await database.select<CountRow[]>(
-    "SELECT COUNT(*) AS count FROM number_components WHERE template_version_id = $1 AND active = 1",
+    `SELECT (
+       (SELECT COUNT(*) FROM number_components WHERE template_version_id = $1 AND active = 1) +
+       (SELECT COUNT(*) FROM learning_components WHERE template_version_id = $1 AND active = 1)
+     ) AS count`,
     [versionId],
   );
   if (Number(componentCount[0]?.count ?? 0) > 0) return;
@@ -105,6 +116,15 @@ function mapComponent(row: ComponentRow): NumberComponent {
   };
 }
 
+function mapLearningComponent(row: LearningComponentRow): NumberComponent {
+  return {
+    databaseId: Number(row.id), id: row.stable_id, type: "learning", label: row.name,
+    hint: "记录今天学到的知识", unit: "分钟", decimalPlaces: 0,
+    defaultValue: null, required: false, minValue: 1, maxValue: 1439,
+    chart: true, chartType: "line", statistic: "latest", color: "#6f9984",
+  };
+}
+
 async function findTemplateVersion(database: Database, date: string): Promise<number> {
   let rows = await database.select<IdRow[]>(
     "SELECT id FROM template_versions WHERE effective_date <= $1 ORDER BY effective_date DESC LIMIT 1", [date],
@@ -123,15 +143,24 @@ export async function loadDay(date: string): Promise<LoadedDay> {
   const templateVersionId = await findTemplateVersion(database, date);
   const rows = await database.select<ComponentRow[]>(
     `SELECT id, stable_id, name, unit, decimal_places, default_value, required,
-            min_value, max_value, chart_enabled, chart_type, statistic, color, component_kind
+            min_value, max_value, chart_enabled, chart_type, statistic, color, component_kind, sort_order
        FROM number_components
       WHERE template_version_id = $1 AND active = 1
       ORDER BY sort_order, id`, [templateVersionId],
   );
-  const components = rows.map(mapComponent);
+  const learningRows = await database.select<LearningComponentRow[]>(
+    `SELECT id, stable_id, name, sort_order FROM learning_components
+      WHERE template_version_id = $1 AND active = 1 ORDER BY sort_order, id`, [templateVersionId],
+  );
+  const components = [
+    ...rows.map((row) => ({ component: mapComponent(row), order: Number(row.sort_order) })),
+    ...learningRows.map((row) => ({ component: mapLearningComponent(row), order: Number(row.sort_order) })),
+  ].sort((a, b) => a.order - b.order).map((item) => item.component);
   const values: Record<string, number | null> = {};
   const touched: Record<string, boolean> = {};
+  const learningEntries: Record<string, LearningEntry[]> = {};
   components.forEach((component) => {
+    if (component.type === "learning") { learningEntries[component.id] = []; return; }
     const keys = component.type === "weight" ? [`${component.id}:morning`, `${component.id}:evening`] : [component.id];
     keys.forEach((key) => { values[key] = null; touched[key] = false; });
   });
@@ -150,11 +179,23 @@ export async function loadDay(date: string): Promise<LoadedDay> {
         touched[key] = true;
       }
     });
+    const learned = await database.select<LearningEntryRow[]>(
+      `SELECT le.id, lc.stable_id, le.logo, le.tag, le.duration_minutes, le.knowledge, le.sort_order
+         FROM learning_entries le JOIN learning_components lc ON lc.id = le.component_id
+        WHERE le.record_id = $1 ORDER BY le.sort_order, le.id`, [records[0].id],
+    );
+    learned.forEach((row) => {
+      if (!(row.stable_id in learningEntries)) return;
+      learningEntries[row.stable_id].push({
+        id: Number(row.id), clientId: `stored-${row.id}`, logo: row.logo, tag: row.tag,
+        durationMinutes: row.duration_minutes === null ? null : Number(row.duration_minutes), knowledge: row.knowledge,
+      });
+    });
   }
-  return { templateVersionId, components, values, touched, hasRecord: records.length > 0 };
+  return { templateVersionId, components, values, touched, learningEntries, hasRecord: records.length > 0 };
 }
 
-export async function saveDay(date: string, versionId: number, components: NumberComponent[], values: Record<string, number | null>, touched: Record<string, boolean>): Promise<void> {
+export async function saveDay(date: string, versionId: number, components: NumberComponent[], values: Record<string, number | null>, touched: Record<string, boolean>, learningEntries: Record<string, LearningEntry[]>): Promise<void> {
   const database = await getDatabase();
   await database.execute(
     `INSERT INTO daily_records (record_date, template_version_id) VALUES ($1, $2)
@@ -164,13 +205,26 @@ export async function saveDay(date: string, versionId: number, components: Numbe
   const rows = await database.select<IdRow[]>("SELECT id FROM daily_records WHERE record_date = $1", [date]);
   const recordId = Number(rows[0].id);
   await database.execute("DELETE FROM number_values WHERE record_id = $1", [recordId]);
+  await database.execute("DELETE FROM learning_entries WHERE record_id = $1", [recordId]);
   for (const component of components) {
+    if (component.type === "learning") {
+      if (component.databaseId === null) continue;
+      for (const [index, entry] of (learningEntries[component.id] ?? []).entries()) {
+        await database.execute(
+          `INSERT INTO learning_entries (record_id, component_id, logo, tag, duration_minutes, knowledge, sort_order)
+           VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+          [recordId, component.databaseId, entry.logo, entry.tag.trim(), entry.durationMinutes, entry.knowledge, index],
+        );
+      }
+      continue;
+    }
     const slots = component.type === "weight" ? ["morning", "evening"] as const : ["single"] as const;
     for (const slot of slots) {
       const key = slot === "single" ? component.id : `${component.id}:${slot}`;
       const value = values[key];
       if (!touched[key] || value === null || component.databaseId === null) continue;
-      const storedValue = component.type === "weight" && component.unit === "斤" ? value / 2 : value;
+      const normalizedValue = component.type === "weight" ? Math.max(0, value) : value;
+      const storedValue = component.type === "weight" && component.unit === "斤" ? normalizedValue / 2 : normalizedValue;
       await database.execute("INSERT INTO number_values (record_id, component_id, measurement_slot, value) VALUES ($1, $2, $3, $4)", [recordId, component.databaseId, slot, storedValue]);
     }
   }
@@ -194,6 +248,16 @@ async function upsertComponent(database: Database, versionId: number, component:
   );
 }
 
+async function upsertLearningComponent(database: Database, versionId: number, component: NumberComponent, order: number): Promise<void> {
+  await database.execute(
+    `INSERT INTO learning_components (stable_id, template_version_id, name, sort_order, active)
+     VALUES ($1,$2,$3,$4,1)
+     ON CONFLICT(template_version_id, stable_id) DO UPDATE SET
+       name=excluded.name, sort_order=excluded.sort_order, active=1`,
+    [component.id, versionId, component.label, order],
+  );
+}
+
 export async function saveTemplate(date: string, components: NumberComponent[]): Promise<void> {
   const database = await getDatabase();
   let rows = await database.select<IdRow[]>("SELECT id FROM template_versions WHERE effective_date = $1", [date]);
@@ -203,12 +267,27 @@ export async function saveTemplate(date: string, components: NumberComponent[]):
   }
   const versionId = Number(rows[0].id);
   await database.execute("UPDATE number_components SET active = 0 WHERE template_version_id = $1", [versionId]);
-  for (const [index, component] of components.entries()) await upsertComponent(database, versionId, component, index);
+  await database.execute("UPDATE learning_components SET active = 0 WHERE template_version_id = $1", [versionId]);
+  for (const [index, component] of components.entries()) {
+    if (component.type === "learning") await upsertLearningComponent(database, versionId, component, index);
+    else await upsertComponent(database, versionId, component, index);
+  }
 }
 
 export async function loadRecordedDates(start: string, end: string): Promise<string[]> {
   const database = await getDatabase();
-  const rows = await database.select<DateRow[]>("SELECT record_date FROM daily_records WHERE record_date BETWEEN $1 AND $2", [start, end]);
+  const rows = await database.select<DateRow[]>(
+    `SELECT dr.record_date FROM daily_records dr
+      WHERE dr.record_date BETWEEN $1 AND $2
+        AND (
+          EXISTS (SELECT 1 FROM number_values nv WHERE nv.record_id = dr.id)
+          OR EXISTS (
+            SELECT 1 FROM learning_entries le
+             WHERE le.record_id = dr.id AND TRIM(le.tag) <> ''
+               AND le.duration_minutes > 0 AND le.duration_minutes < 1440
+          )
+        )`, [start, end],
+  );
   return rows.map((row) => row.record_date);
 }
 
@@ -221,7 +300,17 @@ function previousDateKey(date: string): string {
 export async function loadRecordingStreak(endDate: string): Promise<number> {
   const database = await getDatabase();
   const rows = await database.select<DateRow[]>(
-    "SELECT record_date FROM daily_records WHERE record_date <= $1 ORDER BY record_date DESC",
+    `SELECT dr.record_date FROM daily_records dr
+      WHERE dr.record_date <= $1
+        AND (
+          EXISTS (SELECT 1 FROM number_values nv WHERE nv.record_id = dr.id)
+          OR EXISTS (
+            SELECT 1 FROM learning_entries le
+             WHERE le.record_id = dr.id AND TRIM(le.tag) <> ''
+               AND le.duration_minutes > 0 AND le.duration_minutes < 1440
+          )
+        )
+      ORDER BY dr.record_date DESC`,
     [endDate],
   );
   let expected = endDate;
@@ -246,6 +335,48 @@ export async function loadNumberSeries(stableId: string, start: string, end: str
   const series: ComponentSeries = { single: [], morning: [], evening: [] };
   rows.forEach((row) => series[row.measurement_slot].push({ date: row.record_date, value: Number(row.value) }));
   return series;
+}
+
+export async function loadLearningHistory(stableId: string, start: string, end: string): Promise<LearningHistoryEntry[]> {
+  const database = await getDatabase();
+  const rows = await database.select<LearningEntryRow[]>(
+    `SELECT le.id, lc.stable_id, le.logo, le.tag, le.duration_minutes, le.knowledge,
+            le.sort_order, dr.record_date
+       FROM learning_entries le
+       JOIN daily_records dr ON dr.id = le.record_id
+       JOIN learning_components lc ON lc.id = le.component_id
+      WHERE lc.stable_id = $1 AND dr.record_date BETWEEN $2 AND $3
+        AND TRIM(le.tag) <> '' AND le.duration_minutes > 0 AND le.duration_minutes < 1440
+      ORDER BY dr.record_date, le.sort_order, le.id`, [stableId, start, end],
+  );
+  return rows.map((row) => ({
+    id: Number(row.id), clientId: `history-${row.id}`, date: row.record_date ?? "", logo: row.logo,
+    tag: row.tag, durationMinutes: Number(row.duration_minutes), knowledge: row.knowledge,
+  }));
+}
+
+export async function loadLearningHeatmap(stableId: string, start: string, end: string): Promise<LearningDaySummary[]> {
+  const entries = await loadLearningHistory(stableId, start, end);
+  const days = new Map<string, LearningDaySummary>();
+  entries.forEach((entry) => {
+    let day = days.get(entry.date);
+    if (!day) {
+      day = { date: entry.date, totalMinutes: 0, logos: [], entryCount: 0 };
+      days.set(entry.date, day);
+    }
+    day.totalMinutes += entry.durationMinutes ?? 0;
+    day.logos.push(entry.logo);
+    day.entryCount += 1;
+  });
+  return [...days.values()].sort((a, b) => a.date.localeCompare(b.date));
+}
+
+export async function loadLearningTags(): Promise<string[]> {
+  const database = await getDatabase();
+  const rows = await database.select<Array<{ tag: string }>>(
+    "SELECT tag FROM learning_entries WHERE TRIM(tag) <> '' GROUP BY tag ORDER BY MAX(updated_at) DESC LIMIT 100",
+  );
+  return rows.map((row) => row.tag);
 }
 
 export async function loadTodos(): Promise<TodoItem[]> {
